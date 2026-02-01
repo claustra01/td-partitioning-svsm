@@ -7,6 +7,7 @@
 pub mod error;
 
 mod gctx;
+mod guest_symbols;
 mod gmem;
 mod instr_emul;
 mod interrupts;
@@ -29,6 +30,7 @@ mod vmcs;
 mod vmcs_lib;
 mod vmexit;
 mod vmsr;
+mod tcp_log;
 
 pub use percpu::{run_tdpvp, TdPerCpu};
 pub use tdcall::{
