@@ -6,7 +6,7 @@ extern crate alloc;
 
 use super::gctx::GuestCpuContext;
 use super::gmem::{accept_guest_mem, gva2gpa, GuestMemAccessCode};
-use super::guest_symbols::{maybe_resolve_linux_banner, tcp_hashinfo_gva};
+use super::guest_symbols::tcp_hashinfo_gva;
 use super::percpu::this_vcpu;
 use super::utils::TdpVmId;
 use crate::address::{Address, GuestVirtAddr};
@@ -134,7 +134,6 @@ pub fn maybe_log_tcp_connections(vm_id: TdpVmId) {
         return;
     }
 
-    maybe_resolve_linux_banner(vm_id);
     let tcp_hashinfo = match tcp_hashinfo_gva() {
         Some(gva) => gva,
         None => return,
