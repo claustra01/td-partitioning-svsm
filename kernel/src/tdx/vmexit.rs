@@ -20,13 +20,83 @@ use super::vcpu_comm::VcpuReqFlags;
 use super::vmcs_lib::{VMX_INT_INFO_ERR_CODE_VALID, VMX_INT_INFO_VALID};
 use crate::address::{Address, GuestPhysAddr};
 use crate::cpu::control_regs::{write_xcr, CR4Flags, XCR0Flags, XCR0_RSVD};
+use crate::cpu::cpuid::cpuid;
 use crate::cpu::features::cpu_has_xcr0_features;
 use crate::cpu::idt::common::triple_fault;
 use crate::cpu::interrupts::{disable_irq, enable_irq};
+use crate::cpu::msr::rdtsc;
 use crate::mm::address_space::is_kernel_phys_addr_valid;
 use crate::mm::guestmem::{gpa_is_shared, gpa_strip_c_bit};
 use crate::mm::memory::is_guest_phys_addr_valid;
 use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+const VMEXIT_LOG_INTERVAL_SECS: u64 = 30;
+static VMEXIT_LAST_LOG_TSC: AtomicU64 = AtomicU64::new(0);
+static TSC_HZ_CACHE: AtomicU64 = AtomicU64::new(0);
+
+fn tsc_hz() -> u64 {
+    let cached = TSC_HZ_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+
+    let max_leaf = cpuid(0x0).map(|r| r.eax).unwrap_or(0);
+    let mut hz = 0;
+
+    if max_leaf >= 0x15 {
+        if let Some(leaf) = cpuid(0x15) {
+            let denom = leaf.eax as u64;
+            let numer = leaf.ebx as u64;
+            let crystal = leaf.ecx as u64;
+            if denom != 0 && numer != 0 && crystal != 0 {
+                hz = crystal.saturating_mul(numer) / denom;
+            }
+        }
+    }
+
+    if hz == 0 && max_leaf >= 0x16 {
+        if let Some(leaf) = cpuid(0x16) {
+            let mhz = (leaf.eax & 0xffff) as u64;
+            if mhz != 0 {
+                hz = mhz.saturating_mul(1_000_000);
+            }
+        }
+    }
+
+    if hz != 0 {
+        TSC_HZ_CACHE.store(hz, Ordering::Relaxed);
+    }
+
+    hz
+}
+
+fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
+    let hz = tsc_hz();
+    if hz == 0 {
+        return;
+    }
+
+    let interval = hz.saturating_mul(VMEXIT_LOG_INTERVAL_SECS);
+    let now = rdtsc();
+    let last = VMEXIT_LAST_LOG_TSC.load(Ordering::Relaxed);
+
+    if now.wrapping_sub(last) < interval {
+        return;
+    }
+
+    if VMEXIT_LAST_LOG_TSC
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        log::info!(
+            "vmexit periodic log: vm_id={:?} reason={:?} tsc={:#x}",
+            vm_id,
+            reason,
+            now
+        );
+    }
+}
 
 bitflags::bitflags! {
     #[derive(Copy, Clone, Debug)]
@@ -651,6 +721,7 @@ impl VmExit {
     }
 
     pub fn handle_vmexits(&self) -> Result<(), TdxError> {
+        maybe_log_vmexit(self.vm_id, &self.reason);
         match self.reason {
             VmExitReason::ExceptionNMI {
                 intr_info,
