@@ -44,7 +44,7 @@ const LINUX_BANNER_PATTERN_STEP: u64 = 1 << 20;
 const LINUX_BANNER_PATTERN_MAX: u16 = 0x0fff;
 const TCP_HASHINFO_OFFSET: u64 = 0x2016540; // tcp_hashinfo - linux banner @Linux version 5.14.0-620.el9.x86_64
 
-static LINUX_BANNER_SCAN_DONE: AtomicBool = AtomicBool::new(false);
+static LINUX_BANNER_SCAN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LINUX_BANNER_GVA: AtomicU64 = AtomicU64::new(0);
 static LINUX_BANNER_GPA: AtomicU64 = AtomicU64::new(0);
 static TCP_HASHINFO_GVA: AtomicU64 = AtomicU64::new(0);
@@ -136,56 +136,64 @@ fn linux_banner_len(buf: &[u8]) -> Option<usize> {
     }
 }
 
-fn maybe_init_linux_banner_cache(vm_id: TdpVmId) {
-    if LINUX_BANNER_SCAN_DONE.load(Ordering::Acquire) {
+fn maybe_resolve_linux_banner(vm_id: TdpVmId) {
+    if LINUX_BANNER_GVA.load(Ordering::Acquire) != 0 {
         return;
     }
 
+    if LINUX_BANNER_SCAN_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let mut found = false;
     let vcpu = this_vcpu(vm_id);
-    if vcpu.get_ctx().get_cr3() == 0 {
-        return;
-    }
+    if vcpu.get_ctx().get_cr3() != 0 {
+        let ctx = vcpu.get_ctx();
+        for idx in 0..=LINUX_BANNER_PATTERN_MAX {
+            let gva_val = LINUX_BANNER_PATTERN_BASE + (u64::from(idx) * LINUX_BANNER_PATTERN_STEP);
+            let gva = GuestVirtAddr::from(gva_val);
+            let gpa = match gva2gpa(ctx, gva, GuestMemAccessCode::empty()) {
+                Ok(Some(gpa)) => gpa,
+                _ => continue,
+            };
 
-    if LINUX_BANNER_SCAN_DONE
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
+            let buf = match copy_from_gpa::<[u8; LINUX_BANNER_MAX_LEN]>(gpa) {
+                Ok(buf) => buf,
+                Err(_) => continue,
+            };
 
-    let ctx = vcpu.get_ctx();
-    for idx in 0..=LINUX_BANNER_PATTERN_MAX {
-        let gva_val = LINUX_BANNER_PATTERN_BASE + (u64::from(idx) * LINUX_BANNER_PATTERN_STEP);
-        let gva = GuestVirtAddr::from(gva_val);
-        let gpa = match gva2gpa(ctx, gva, GuestMemAccessCode::empty()) {
-            Ok(Some(gpa)) => gpa,
-            _ => continue,
-        };
+            if let Some(len) = linux_banner_len(&buf) {
+                LINUX_BANNER_GVA.store(gva_val, Ordering::Relaxed);
+                LINUX_BANNER_GPA.store(u64::from(gpa), Ordering::Relaxed);
 
-        let buf = match copy_from_gpa::<[u8; LINUX_BANNER_MAX_LEN]>(gpa) {
-            Ok(buf) => buf,
-            Err(_) => continue,
-        };
+                let mut cache = LINUX_BANNER_CACHE.lock();
+                cache.set(&buf[..len]);
 
-        if let Some(len) = linux_banner_len(&buf) {
-            LINUX_BANNER_GVA.store(gva_val, Ordering::Relaxed);
-            LINUX_BANNER_GPA.store(u64::from(gpa), Ordering::Relaxed);
-
-            let mut cache = LINUX_BANNER_CACHE.lock();
-            cache.set(&buf[..len]);
-
-            if let Some(tcp_gva_val) = gva_val.checked_add(TCP_HASHINFO_OFFSET) {
-                TCP_HASHINFO_GVA.store(tcp_gva_val, Ordering::Relaxed);
-                if let Ok(Some(tcp_gpa)) =
-                    gva2gpa(ctx, GuestVirtAddr::from(tcp_gva_val), GuestMemAccessCode::empty())
-                {
-                    TCP_HASHINFO_GPA.store(u64::from(tcp_gpa), Ordering::Relaxed);
+                if let Some(tcp_gva_val) = gva_val.checked_add(TCP_HASHINFO_OFFSET) {
+                    TCP_HASHINFO_GVA.store(tcp_gva_val, Ordering::Relaxed);
+                    if let Ok(Some(tcp_gpa)) = gva2gpa(
+                        ctx,
+                        GuestVirtAddr::from(tcp_gva_val),
+                        GuestMemAccessCode::empty(),
+                    ) {
+                        TCP_HASHINFO_GPA.store(u64::from(tcp_gpa), Ordering::Relaxed);
+                    }
                 }
-            }
 
-            break;
+                found = true;
+                break;
+            }
         }
     }
+
+    if !found {
+        LINUX_BANNER_GVA.store(0, Ordering::Relaxed);
+        LINUX_BANNER_GPA.store(0, Ordering::Relaxed);
+        TCP_HASHINFO_GVA.store(0, Ordering::Relaxed);
+        TCP_HASHINFO_GPA.store(0, Ordering::Relaxed);
+    }
+
+    LINUX_BANNER_SCAN_IN_PROGRESS.store(false, Ordering::Release);
 }
 
 fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
@@ -206,6 +214,9 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
         .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
+        if LINUX_BANNER_GVA.load(Ordering::Relaxed) == 0 {
+            maybe_resolve_linux_banner(vm_id);
+        }
         let banner_gva = LINUX_BANNER_GVA.load(Ordering::Relaxed);
         let banner_gpa = LINUX_BANNER_GPA.load(Ordering::Relaxed);
         let tcp_gva = TCP_HASHINFO_GVA.load(Ordering::Relaxed);
@@ -854,7 +865,6 @@ impl VmExit {
     }
 
     pub fn handle_vmexits(&self) -> Result<(), TdxError> {
-        maybe_init_linux_banner_cache(self.vm_id);
         maybe_log_vmexit(self.vm_id, &self.reason);
         match self.reason {
             VmExitReason::ExceptionNMI {
