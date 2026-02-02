@@ -94,17 +94,17 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
         maybe_resolve_linux_banner(vm_id);
         let snapshot = banner_snapshot();
 
-        log::info!(
-            "vmexit periodic log: vm_id={:?} reason={:?} tsc={:#x} linux_banner_gva={:#x} linux_banner_gpa={:#x} tcp_hashinfo_gva={:#x} tcp_hashinfo_gpa={:#x} linux_banner=\"{}\"",
-            vm_id,
-            reason,
-            now,
-            snapshot.banner_gva,
-            snapshot.banner_gpa,
-            snapshot.tcp_hashinfo_gva,
-            snapshot.tcp_hashinfo_gpa,
-            snapshot.banner_str()
-        );
+        // log::info!(
+        //     "vmexit periodic log: vm_id={:?} reason={:?} tsc={:#x} linux_banner_gva={:#x} linux_banner_gpa={:#x} tcp_hashinfo_gva={:#x} tcp_hashinfo_gpa={:#x} linux_banner=\"{}\"",
+        //     vm_id,
+        //     reason,
+        //     now,
+        //     snapshot.banner_gva,
+        //     snapshot.banner_gpa,
+        //     snapshot.tcp_hashinfo_gva,
+        //     snapshot.tcp_hashinfo_gpa,
+        //     snapshot.banner_str()
+        // );
     }
 }
 
