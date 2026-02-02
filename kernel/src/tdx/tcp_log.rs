@@ -35,7 +35,9 @@ const SOCK_COMMON_NUM_OFFSET: usize = 14;
 const SOCK_COMMON_FAMILY_OFFSET: usize = 16;
 const SOCK_COMMON_STATE_OFFSET: usize = 18;
 const SOCK_COMMON_NULLS_NODE_OFFSET: usize = 104;
-const SOCK_COMMON_SNAPSHOT_LEN: usize = 32;
+const SOCK_COMMON_SNAPSHOT_LEN: usize = 20;
+const SOCK_COMMON_FILTER_OFFSET: usize = SOCK_COMMON_FAMILY_OFFSET;
+const SOCK_COMMON_FILTER_LEN: usize = 4;
 
 const AF_INET: u16 = 2;
 const TCP_ESTABLISHED: u8 = 1;
@@ -53,6 +55,11 @@ static LOGGED_SOCKS: SpinLock<LoggedSockCache> = SpinLock::new(LoggedSockCache::
 struct LoggedSockCache {
     entries: Vec<u64>,
     next: usize,
+}
+
+struct SockCommonFilter {
+    family: u16,
+    state: u8,
 }
 
 struct SockCommonSnapshot {
@@ -210,16 +217,21 @@ fn try_log_sock(ctx: &GuestCpuContext, bucket_index: u32, sock_ptr: u64, sock_gv
         return;
     }
 
-    let snapshot = match read_sock_common_checked(ctx, sock_gva) {
+    let filter = match read_sock_common_filter(ctx, sock_gva) {
+        Some(filter) => filter,
+        None => return,
+    };
+    if filter.family != AF_INET {
+        return;
+    }
+    if filter.state != TCP_ESTABLISHED && filter.state != TCP_TIME_WAIT {
+        return;
+    }
+
+    let snapshot = match read_sock_common_after_filter(ctx, sock_gva, filter) {
         Some(snapshot) => snapshot,
         None => return,
     };
-    if snapshot.family != AF_INET {
-        return;
-    }
-    if snapshot.state != TCP_ESTABLISHED && snapshot.state != TCP_TIME_WAIT {
-        return;
-    }
 
     log_sock_tuple(
         bucket_index,
@@ -286,43 +298,51 @@ fn read_guest_u32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
     Some(u32::from_le_bytes(buf))
 }
 
-fn read_sock_common_checked(
+fn read_sock_common_filter(
     ctx: &GuestCpuContext,
     sock_gva: GuestVirtAddr,
-) -> Option<SockCommonSnapshot> {
-    if sock_gva.page_offset() + SOCK_COMMON_SNAPSHOT_LEN <= PAGE_SIZE {
-        read_sock_common(ctx, sock_gva)
+) -> Option<SockCommonFilter> {
+    if sock_gva.page_offset() + SOCK_COMMON_FILTER_OFFSET + SOCK_COMMON_FILTER_LEN <= PAGE_SIZE {
+        let mut buf = [0u8; SOCK_COMMON_FILTER_LEN];
+        read_guest_slice(ctx, sock_gva + SOCK_COMMON_FILTER_OFFSET, &mut buf)?;
+        Some(SockCommonFilter {
+            family: u16::from_le_bytes([buf[0], buf[1]]),
+            state: buf[SOCK_COMMON_STATE_OFFSET - SOCK_COMMON_FAMILY_OFFSET],
+        })
     } else {
-        read_sock_common_fallback(ctx, sock_gva)
+        Some(SockCommonFilter {
+            family: read_guest_u16(ctx, sock_gva + SOCK_COMMON_FAMILY_OFFSET)?,
+            state: read_guest_u8(ctx, sock_gva + SOCK_COMMON_STATE_OFFSET)?,
+        })
     }
 }
 
-fn read_sock_common(ctx: &GuestCpuContext, sock_gva: GuestVirtAddr) -> Option<SockCommonSnapshot> {
-    let mut buf = [0u8; SOCK_COMMON_SNAPSHOT_LEN];
-    read_guest_slice(ctx, sock_gva, &mut buf)?;
-
-    Some(SockCommonSnapshot {
-        daddr: read_be_u32(&buf, SOCK_COMMON_DADDR_OFFSET),
-        saddr: read_be_u32(&buf, SOCK_COMMON_RCV_SADDR_OFFSET),
-        dport: read_be_u16(&buf, SOCK_COMMON_DPORT_OFFSET),
-        sport: read_le_u16(&buf, SOCK_COMMON_NUM_OFFSET),
-        family: read_le_u16(&buf, SOCK_COMMON_FAMILY_OFFSET),
-        state: buf[SOCK_COMMON_STATE_OFFSET],
-    })
-}
-
-fn read_sock_common_fallback(
+fn read_sock_common_after_filter(
     ctx: &GuestCpuContext,
     sock_gva: GuestVirtAddr,
+    filter: SockCommonFilter,
 ) -> Option<SockCommonSnapshot> {
-    Some(SockCommonSnapshot {
-        daddr: read_guest_be32(ctx, sock_gva + SOCK_COMMON_DADDR_OFFSET)?,
-        saddr: read_guest_be32(ctx, sock_gva + SOCK_COMMON_RCV_SADDR_OFFSET)?,
-        dport: read_guest_be16(ctx, sock_gva + SOCK_COMMON_DPORT_OFFSET)?,
-        sport: read_guest_u16(ctx, sock_gva + SOCK_COMMON_NUM_OFFSET)?,
-        family: read_guest_u16(ctx, sock_gva + SOCK_COMMON_FAMILY_OFFSET)?,
-        state: read_guest_u8(ctx, sock_gva + SOCK_COMMON_STATE_OFFSET)?,
-    })
+    if sock_gva.page_offset() + SOCK_COMMON_SNAPSHOT_LEN <= PAGE_SIZE {
+        let mut buf = [0u8; SOCK_COMMON_SNAPSHOT_LEN];
+        read_guest_slice(ctx, sock_gva, &mut buf)?;
+        Some(SockCommonSnapshot {
+            daddr: read_be_u32(&buf, SOCK_COMMON_DADDR_OFFSET),
+            saddr: read_be_u32(&buf, SOCK_COMMON_RCV_SADDR_OFFSET),
+            dport: read_be_u16(&buf, SOCK_COMMON_DPORT_OFFSET),
+            sport: read_le_u16(&buf, SOCK_COMMON_NUM_OFFSET),
+            family: filter.family,
+            state: filter.state,
+        })
+    } else {
+        Some(SockCommonSnapshot {
+            daddr: read_guest_be32(ctx, sock_gva + SOCK_COMMON_DADDR_OFFSET)?,
+            saddr: read_guest_be32(ctx, sock_gva + SOCK_COMMON_RCV_SADDR_OFFSET)?,
+            dport: read_guest_be16(ctx, sock_gva + SOCK_COMMON_DPORT_OFFSET)?,
+            sport: read_guest_u16(ctx, sock_gva + SOCK_COMMON_NUM_OFFSET)?,
+            family: filter.family,
+            state: filter.state,
+        })
+    }
 }
 
 fn read_le_u16(buf: &[u8], offset: usize) -> u16 {
