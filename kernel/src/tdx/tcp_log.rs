@@ -35,6 +35,7 @@ const SOCK_COMMON_NUM_OFFSET: usize = 14;
 const SOCK_COMMON_FAMILY_OFFSET: usize = 16;
 const SOCK_COMMON_STATE_OFFSET: usize = 18;
 const SOCK_COMMON_NULLS_NODE_OFFSET: usize = 104;
+const SOCK_COMMON_SNAPSHOT_LEN: usize = 32;
 
 const AF_INET: u16 = 2;
 const TCP_ESTABLISHED: u8 = 1;
@@ -52,6 +53,15 @@ static LOGGED_SOCKS: SpinLock<LoggedSockCache> = SpinLock::new(LoggedSockCache::
 struct LoggedSockCache {
     entries: Vec<u64>,
     next: usize,
+}
+
+struct SockCommonSnapshot {
+    daddr: u32,
+    saddr: u32,
+    dport: u16,
+    sport: u16,
+    family: u16,
+    state: u8,
 }
 
 impl LoggedSockCache {
@@ -200,40 +210,26 @@ fn try_log_sock(ctx: &GuestCpuContext, bucket_index: u32, sock_ptr: u64, sock_gv
         return;
     }
 
-    let family = match read_guest_u16(ctx, sock_gva + SOCK_COMMON_FAMILY_OFFSET) {
-        Some(val) => val,
+    let snapshot = match read_sock_common(ctx, sock_gva) {
+        Some(snapshot) => snapshot,
         None => return,
     };
-    if family != AF_INET {
+    if snapshot.family != AF_INET {
+        return;
+    }
+    if snapshot.state != TCP_ESTABLISHED && snapshot.state != TCP_TIME_WAIT {
         return;
     }
 
-    let state = match read_guest_u8(ctx, sock_gva + SOCK_COMMON_STATE_OFFSET) {
-        Some(val) => val,
-        None => return,
-    };
-    if state != TCP_ESTABLISHED && state != TCP_TIME_WAIT {
-        return;
-    }
-
-    let daddr = match read_guest_be32(ctx, sock_gva + SOCK_COMMON_DADDR_OFFSET) {
-        Some(val) => val,
-        None => return,
-    };
-    let saddr = match read_guest_be32(ctx, sock_gva + SOCK_COMMON_RCV_SADDR_OFFSET) {
-        Some(val) => val,
-        None => return,
-    };
-    let dport = match read_guest_be16(ctx, sock_gva + SOCK_COMMON_DPORT_OFFSET) {
-        Some(val) => val,
-        None => return,
-    };
-    let sport = match read_guest_u16(ctx, sock_gva + SOCK_COMMON_NUM_OFFSET) {
-        Some(val) => val,
-        None => return,
-    };
-
-    log_sock_tuple(bucket_index, sock_ptr, state, saddr, sport, daddr, dport);
+    log_sock_tuple(
+        bucket_index,
+        sock_ptr,
+        snapshot.state,
+        snapshot.saddr,
+        snapshot.sport,
+        snapshot.daddr,
+        snapshot.dport,
+    );
     mark_sock_logged(sock_ptr);
 }
 
@@ -290,28 +286,35 @@ fn read_guest_u32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
     Some(u32::from_le_bytes(buf))
 }
 
-fn read_guest_u16(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u16> {
-    let mut buf = [0u8; 2];
-    read_guest_slice(ctx, gva, &mut buf)?;
-    Some(u16::from_le_bytes(buf))
+fn read_sock_common(ctx: &GuestCpuContext, sock_gva: GuestVirtAddr) -> Option<SockCommonSnapshot> {
+    let mut buf = [0u8; SOCK_COMMON_SNAPSHOT_LEN];
+    read_guest_slice(ctx, sock_gva, &mut buf)?;
+
+    Some(SockCommonSnapshot {
+        daddr: read_be_u32(&buf, SOCK_COMMON_DADDR_OFFSET),
+        saddr: read_be_u32(&buf, SOCK_COMMON_RCV_SADDR_OFFSET),
+        dport: read_be_u16(&buf, SOCK_COMMON_DPORT_OFFSET),
+        sport: read_le_u16(&buf, SOCK_COMMON_NUM_OFFSET),
+        family: read_le_u16(&buf, SOCK_COMMON_FAMILY_OFFSET),
+        state: buf[SOCK_COMMON_STATE_OFFSET],
+    })
 }
 
-fn read_guest_u8(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u8> {
-    let mut buf = [0u8; 1];
-    read_guest_slice(ctx, gva, &mut buf)?;
-    Some(buf[0])
+fn read_le_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
 
-fn read_guest_be16(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u16> {
-    let mut buf = [0u8; 2];
-    read_guest_slice(ctx, gva, &mut buf)?;
-    Some(u16::from_be_bytes(buf))
+fn read_be_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([buf[offset], buf[offset + 1]])
 }
 
-fn read_guest_be32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
-    let mut buf = [0u8; 4];
-    read_guest_slice(ctx, gva, &mut buf)?;
-    Some(u32::from_be_bytes(buf))
+fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 fn read_guest_slice(ctx: &GuestCpuContext, gva: GuestVirtAddr, buf: &mut [u8]) -> Option<()> {
