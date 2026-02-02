@@ -210,7 +210,7 @@ fn try_log_sock(ctx: &GuestCpuContext, bucket_index: u32, sock_ptr: u64, sock_gv
         return;
     }
 
-    let snapshot = match read_sock_common(ctx, sock_gva) {
+    let snapshot = match read_sock_common_checked(ctx, sock_gva) {
         Some(snapshot) => snapshot,
         None => return,
     };
@@ -286,6 +286,17 @@ fn read_guest_u32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
     Some(u32::from_le_bytes(buf))
 }
 
+fn read_sock_common_checked(
+    ctx: &GuestCpuContext,
+    sock_gva: GuestVirtAddr,
+) -> Option<SockCommonSnapshot> {
+    if sock_gva.page_offset() + SOCK_COMMON_SNAPSHOT_LEN <= PAGE_SIZE {
+        read_sock_common(ctx, sock_gva)
+    } else {
+        read_sock_common_fallback(ctx, sock_gva)
+    }
+}
+
 fn read_sock_common(ctx: &GuestCpuContext, sock_gva: GuestVirtAddr) -> Option<SockCommonSnapshot> {
     let mut buf = [0u8; SOCK_COMMON_SNAPSHOT_LEN];
     read_guest_slice(ctx, sock_gva, &mut buf)?;
@@ -297,6 +308,20 @@ fn read_sock_common(ctx: &GuestCpuContext, sock_gva: GuestVirtAddr) -> Option<So
         sport: read_le_u16(&buf, SOCK_COMMON_NUM_OFFSET),
         family: read_le_u16(&buf, SOCK_COMMON_FAMILY_OFFSET),
         state: buf[SOCK_COMMON_STATE_OFFSET],
+    })
+}
+
+fn read_sock_common_fallback(
+    ctx: &GuestCpuContext,
+    sock_gva: GuestVirtAddr,
+) -> Option<SockCommonSnapshot> {
+    Some(SockCommonSnapshot {
+        daddr: read_guest_be32(ctx, sock_gva + SOCK_COMMON_DADDR_OFFSET)?,
+        saddr: read_guest_be32(ctx, sock_gva + SOCK_COMMON_RCV_SADDR_OFFSET)?,
+        dport: read_guest_be16(ctx, sock_gva + SOCK_COMMON_DPORT_OFFSET)?,
+        sport: read_guest_u16(ctx, sock_gva + SOCK_COMMON_NUM_OFFSET)?,
+        family: read_guest_u16(ctx, sock_gva + SOCK_COMMON_FAMILY_OFFSET)?,
+        state: read_guest_u8(ctx, sock_gva + SOCK_COMMON_STATE_OFFSET)?,
     })
 }
 
@@ -315,6 +340,30 @@ fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
         buf[offset + 2],
         buf[offset + 3],
     ])
+}
+
+fn read_guest_u16(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    read_guest_slice(ctx, gva, &mut buf)?;
+    Some(u16::from_le_bytes(buf))
+}
+
+fn read_guest_u8(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    read_guest_slice(ctx, gva, &mut buf)?;
+    Some(buf[0])
+}
+
+fn read_guest_be16(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    read_guest_slice(ctx, gva, &mut buf)?;
+    Some(u16::from_be_bytes(buf))
+}
+
+fn read_guest_be32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    read_guest_slice(ctx, gva, &mut buf)?;
+    Some(u32::from_be_bytes(buf))
 }
 
 fn read_guest_slice(ctx: &GuestCpuContext, gva: GuestVirtAddr, buf: &mut [u8]) -> Option<()> {
