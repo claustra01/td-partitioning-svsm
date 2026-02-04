@@ -43,7 +43,7 @@ const TCP_TIME_WAIT: u8 = 6;
 const HLIST_NULLS_MARKER_BIT: u64 = 0x1;
 const MAX_BUCKET_NODES: usize = 64;
 const MAX_LOGGED_SOCKS: usize = 1024;
-const TCP_SCAN_INTERVAL_SECS: u64 = 1;
+const TCP_SCAN_INTERVAL_SECS: u64 = 10;
 
 static LAST_TCP_SCAN_TSC: AtomicU64 = AtomicU64::new(0);
 static TCP_TSC_HZ_CACHE: AtomicU64 = AtomicU64::new(0);
