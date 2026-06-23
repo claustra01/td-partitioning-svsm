@@ -15,8 +15,8 @@ use super::tdcall::{tdcall_get_td_info, tdvmcall_sti_halt};
 use super::tdp::this_tdp;
 use super::utils::{
     td_add_page_alias, GPAAttr, L2ExitInfo, TdCallLeaf, TdVmCallLeaf, TdpVmId, DUMMY_EXIT_REASON,
-    TDCS_NOTIFY_ENABLES, TDG_VP_VMCALL_INVALID_OPERAND, TDG_VP_VMCALL_RETRY, TDG_VP_VMCALL_SUCCESS,
-    TDX_OPERAND_INVALID, TDX_SUCCESS,
+    MAX_NUM_L2_VMS, TDCS_NOTIFY_ENABLES, TDG_VP_VMCALL_INVALID_OPERAND, TDG_VP_VMCALL_RETRY,
+    TDG_VP_VMCALL_SUCCESS, TDX_OPERAND_INVALID, TDX_SUCCESS,
 };
 use super::vcpu_comm::VcpuReqFlags;
 use super::vmcs_lib::{VMX_INT_INFO_ERR_CODE_VALID, VMX_INT_INFO_VALID};
@@ -34,7 +34,12 @@ use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const VMEXIT_LOG_INTERVAL_SECS: u64 = 30;
-static VMEXIT_LAST_LOG_TSC: AtomicU64 = AtomicU64::new(0);
+static VMEXIT_TOTAL_COUNT: [AtomicU64; MAX_NUM_L2_VMS] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static VMEXIT_LAST_LOG_COUNT: [AtomicU64; MAX_NUM_L2_VMS] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static VMEXIT_LAST_LOG_TSC: [AtomicU64; MAX_NUM_L2_VMS] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static TSC_HZ_CACHE: AtomicU64 = AtomicU64::new(0);
 
 fn tsc_hz() -> u64 {
@@ -74,6 +79,15 @@ fn tsc_hz() -> u64 {
 }
 
 fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
+    if matches!(*reason, VmExitReason::Dummy) {
+        return;
+    }
+
+    let vm_index = vm_id.index();
+    let total_count = VMEXIT_TOTAL_COUNT[vm_index]
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+
     let hz = tsc_hz();
     if hz == 0 {
         return;
@@ -81,30 +95,44 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
 
     let interval = hz.saturating_mul(VMEXIT_LOG_INTERVAL_SECS);
     let now = rdtsc();
-    let last = VMEXIT_LAST_LOG_TSC.load(Ordering::Relaxed);
+    let last = VMEXIT_LAST_LOG_TSC[vm_index].load(Ordering::Relaxed);
 
-    if now.wrapping_sub(last) < interval {
+    if last == 0 {
+        if VMEXIT_LAST_LOG_TSC[vm_index]
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            VMEXIT_LAST_LOG_COUNT[vm_index].store(total_count, Ordering::Relaxed);
+        }
         return;
     }
 
-    if VMEXIT_LAST_LOG_TSC
+    let elapsed_tsc = now.wrapping_sub(last);
+    if elapsed_tsc < interval {
+        return;
+    }
+
+    if VMEXIT_LAST_LOG_TSC[vm_index]
         .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
+        let last_count = VMEXIT_LAST_LOG_COUNT[vm_index].swap(total_count, Ordering::Relaxed);
+        let interval_count = total_count.wrapping_sub(last_count);
         maybe_resolve_linux_banner(vm_id);
         let snapshot = banner_snapshot();
 
-        // log::info!(
-        //     "vmexit periodic log: vm_id={:?} reason={:?} tsc={:#x} linux_banner_gva={:#x} linux_banner_gpa={:#x} tcp_hashinfo_gva={:#x} tcp_hashinfo_gpa={:#x} linux_banner=\"{}\"",
-        //     vm_id,
-        //     reason,
-        //     now,
-        //     snapshot.banner_gva,
-        //     snapshot.banner_gpa,
-        //     snapshot.tcp_hashinfo_gva,
-        //     snapshot.tcp_hashinfo_gpa,
-        //     snapshot.banner_str()
-        // );
+        log::info!(
+            "vmexit heartbeat: vm_id={:?} total={} interval_count={} elapsed_tsc={} rate={}/{}/tsc last_reason={:?} linux_banner_gpa={:#x} tcp_hashinfo_gpa={:#x}",
+            vm_id,
+            total_count,
+            interval_count,
+            elapsed_tsc,
+            interval_count,
+            elapsed_tsc,
+            reason,
+            snapshot.banner_gpa,
+            snapshot.tcp_hashinfo_gpa,
+        );
     }
 }
 
