@@ -78,6 +78,26 @@ fn tsc_hz() -> u64 {
     hz
 }
 
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    if value > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
+fn elapsed_ms(elapsed_tsc: u64, hz: u64) -> u64 {
+    saturating_u128_to_u64((elapsed_tsc as u128).saturating_mul(1_000) / hz as u128)
+}
+
+fn rate_x1000_per_ms(count: u64, elapsed_tsc: u64, hz: u64) -> u64 {
+    if elapsed_tsc == 0 {
+        return 0;
+    }
+
+    saturating_u128_to_u64((count as u128).saturating_mul(hz as u128) / elapsed_tsc as u128)
+}
+
 fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
     if matches!(*reason, VmExitReason::Dummy) {
         return;
@@ -118,18 +138,19 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
     {
         let last_count = VMEXIT_LAST_LOG_COUNT[vm_index].swap(total_count, Ordering::Relaxed);
         let interval_count = total_count.wrapping_sub(last_count);
+        let rate = rate_x1000_per_ms(interval_count, elapsed_tsc, hz);
         maybe_resolve_linux_banner(vm_id);
         let snapshot = banner_snapshot();
 
         log::info!(
-            "vmexit heartbeat: vm_id={:?} total={} interval_count={} elapsed_tsc={} rate={}/{}/tsc last_reason={:?} linux_banner_gpa={:#x} tcp_hashinfo_gpa={:#x}",
+            "vmexit heartbeat: vm_id={:?} total={} interval_count={} elapsed_tsc={} elapsed_ms={} rate={}.{:03}/ms linux_banner_gpa={:#x} tcp_hashinfo_gpa={:#x}",
             vm_id,
             total_count,
             interval_count,
             elapsed_tsc,
-            interval_count,
-            elapsed_tsc,
-            reason,
+            elapsed_ms(elapsed_tsc, hz),
+            rate / 1_000,
+            rate % 1_000,
             snapshot.banner_gpa,
             snapshot.tcp_hashinfo_gpa,
         );
