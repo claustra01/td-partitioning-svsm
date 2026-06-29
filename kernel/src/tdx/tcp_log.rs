@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-// Offsets derived from memo/pahole.log (Linux 5.14.0-620.el9.x86_64)
+// Offsets derived from memo/pahole.log (Linux 6.12.0-233.el10.x86_64)
 const INET_HASHINFO_EHASH_OFFSET: usize = 0;
 const INET_HASHINFO_EHASH_MASK_OFFSET: usize = 16;
 const INET_EHASH_BUCKET_SIZE: usize = 8;
@@ -248,16 +248,16 @@ fn log_sock_tuple(
 ) {
     let src_ip = ipv4_to_string(saddr);
     let dst_ip = ipv4_to_string(daddr);
-    // log::info!(
-    //     "L2VM TCP: bucket={} sock=0x{:x} state={} {}:{} -> {}:{}",
-    //     bucket_index,
-    //     sock_ptr,
-    //     state,
-    //     src_ip,
-    //     sport,
-    //     dst_ip,
-    //     dport
-    // );
+    log::info!(
+        "L2VM TCP: bucket={} sock=0x{:x} state={} {}:{} -> {}:{}",
+        bucket_index,
+        sock_ptr,
+        state,
+        src_ip,
+        sport,
+        dst_ip,
+        dport
+    );
 }
 
 fn ipv4_to_string(addr_be: u32) -> String {
