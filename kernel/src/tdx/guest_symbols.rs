@@ -11,11 +11,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const LINUX_BANNER_PREFIX: &[u8] = b"Linux version";
 const LINUX_BANNER_MAX_LEN: usize = 256;
-// Pattern: ffffffff***00a20 where *** ranges 0x000..0xfff (KASLRオフセット想定)
-const LINUX_BANNER_PATTERN_BASE: u64 = 0xffffffff00000a20;
+// Pattern: ffffffff***5a0c0 where *** ranges 0x000..0xfff (KASLRオフセット想定)
+const LINUX_BANNER_PATTERN_BASE: u64 = 0xffffffff0005a0c0;
 const LINUX_BANNER_PATTERN_STEP: u64 = 1 << 20;
 const LINUX_BANNER_PATTERN_MAX: u16 = 0x0fff;
-pub const TCP_HASHINFO_OFFSET: u64 = 0x2016540; // tcp_hashinfo - linux banner @Linux version 5.14.0-620.el9.x86_64
+pub const TCP_HASHINFO_OFFSET: u64 = 0x204C940; // tcp_hashinfo - linux banner @Linux version 6.12.0-233.el10.x86_64
 
 static LINUX_BANNER_SCAN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LINUX_BANNER_GVA: AtomicU64 = AtomicU64::new(0);
