@@ -189,16 +189,16 @@ fn log_sock_tuple(
 ) {
     let src_ip = ipv4_to_string(saddr);
     let dst_ip = ipv4_to_string(daddr);
-    log::info!(
-        "L2VM TCP: bucket={} sock=0x{:x} state={} {}:{} -> {}:{}",
-        bucket_index,
-        sock_ptr,
-        state,
-        src_ip,
-        sport,
-        dst_ip,
-        dport
-    );
+    // log::info!(
+    //     "L2VM TCP: bucket={} sock=0x{:x} state={} {}:{} -> {}:{}",
+    //     bucket_index,
+    //     sock_ptr,
+    //     state,
+    //     src_ip,
+    //     sport,
+    //     dst_ip,
+    //     dport
+    // );
 }
 
 fn ipv4_to_string(addr_be: u32) -> String {
