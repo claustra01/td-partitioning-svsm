@@ -92,6 +92,7 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
         .is_ok()
     {
         maybe_resolve_linux_banner(vm_id);
+        tcp_log::maybe_log_tcp_connections(vm_id);
         let snapshot = banner_snapshot();
 
         // log::info!(
@@ -731,7 +732,6 @@ impl VmExit {
     }
 
     pub fn handle_vmexits(&self) -> Result<(), TdxError> {
-        tcp_log::maybe_log_tcp_connections(self.vm_id);
         maybe_log_vmexit(self.vm_id, &self.reason);
         match self.reason {
             VmExitReason::ExceptionNMI {

@@ -10,8 +10,6 @@ use super::guest_symbols::tcp_hashinfo_gva;
 use super::percpu::this_vcpu;
 use super::utils::TdpVmId;
 use crate::address::{Address, GuestVirtAddr};
-use crate::cpu::cpuid::cpuid;
-use crate::cpu::msr::rdtsc;
 use crate::locking::SpinLock;
 use crate::mm::guestmem::GuestMemMap;
 use crate::types::PAGE_SIZE;
@@ -19,7 +17,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::min;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 // Offsets derived from memo/pahole.log (Linux 6.12.0-233.el10.x86_64)
 const INET_HASHINFO_EHASH_OFFSET: usize = 0;
@@ -43,10 +40,7 @@ const TCP_TIME_WAIT: u8 = 6;
 const HLIST_NULLS_MARKER_BIT: u64 = 0x1;
 const MAX_BUCKET_NODES: usize = 64;
 const MAX_LOGGED_SOCKS: usize = 1024;
-const TCP_SCAN_INTERVAL_SECS: u64 = 10;
 
-static LAST_TCP_SCAN_TSC: AtomicU64 = AtomicU64::new(0);
-static TCP_TSC_HZ_CACHE: AtomicU64 = AtomicU64::new(0);
 static LOGGED_SOCKS: SpinLock<LoggedSockCache> = SpinLock::new(LoggedSockCache::new());
 
 struct LoggedSockCache {
@@ -80,60 +74,7 @@ impl LoggedSockCache {
     }
 }
 
-fn tsc_hz() -> u64 {
-    let cached = TCP_TSC_HZ_CACHE.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
-    }
-
-    let max_leaf = cpuid(0x0).map(|r| r.eax).unwrap_or(0);
-    let mut hz = 0;
-
-    if max_leaf >= 0x15 {
-        if let Some(leaf) = cpuid(0x15) {
-            let denom = leaf.eax as u64;
-            let numer = leaf.ebx as u64;
-            let crystal = leaf.ecx as u64;
-            if denom != 0 && numer != 0 && crystal != 0 {
-                hz = crystal.saturating_mul(numer) / denom;
-            }
-        }
-    }
-
-    if hz == 0 && max_leaf >= 0x16 {
-        if let Some(leaf) = cpuid(0x16) {
-            let mhz = (leaf.eax & 0xffff) as u64;
-            if mhz != 0 {
-                hz = mhz.saturating_mul(1_000_000);
-            }
-        }
-    }
-
-    if hz != 0 {
-        TCP_TSC_HZ_CACHE.store(hz, Ordering::Relaxed);
-    }
-
-    hz
-}
-
 pub fn maybe_log_tcp_connections(vm_id: TdpVmId) {
-    let hz = tsc_hz();
-    if hz == 0 {
-        return;
-    }
-
-    let now = rdtsc();
-    let last = LAST_TCP_SCAN_TSC.load(Ordering::Relaxed);
-    if now.wrapping_sub(last) < hz.saturating_mul(TCP_SCAN_INTERVAL_SECS) {
-        return;
-    }
-    if LAST_TCP_SCAN_TSC
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-
     let tcp_hashinfo = match tcp_hashinfo_gva() {
         Some(gva) => gva,
         None => return,
