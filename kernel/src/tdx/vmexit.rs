@@ -7,7 +7,7 @@
 use super::error::{ErrExcp, TdxError};
 use super::gctx::{GuestCpuContext, GuestCpuGPRegCode};
 use super::gmem::{accept_guest_mem, convert_guest_mem};
-use super::guest_symbols::{banner_snapshot, maybe_resolve_linux_banner};
+use super::guest_symbols::maybe_resolve_linux_banner;
 use super::ioreq::{IoDirection, IoReq, IoType};
 use super::percpu::{this_vcpu, this_vcpu_mut};
 use super::tcp_log;
@@ -31,19 +31,24 @@ use crate::mm::address_space::is_kernel_phys_addr_valid;
 use crate::mm::guestmem::{gpa_is_shared, gpa_strip_c_bit};
 use crate::mm::memory::is_guest_phys_addr_valid;
 use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const VMEXIT_LOG_INTERVAL_SECS: u64 = 30;
+const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
+const KVM_CPUID_TSC_FREQUENCY: u32 = KVM_CPUID_SIGNATURE | 0x10;
+
+static VMEXIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static VMEXIT_LAST_LOG_TSC: AtomicU64 = AtomicU64::new(0);
+static TSC_HZ_PROBED: AtomicBool = AtomicBool::new(false);
 static TSC_HZ_CACHE: AtomicU64 = AtomicU64::new(0);
 
 fn tsc_hz() -> u64 {
-    let cached = TSC_HZ_CACHE.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
+    if TSC_HZ_PROBED.load(Ordering::Acquire) {
+        return TSC_HZ_CACHE.load(Ordering::Relaxed);
     }
 
     let max_leaf = cpuid(0x0).map(|r| r.eax).unwrap_or(0);
+    let max_hypervisor_leaf = cpuid(KVM_CPUID_SIGNATURE).map(|r| r.eax).unwrap_or(0);
     let mut hz = 0;
 
     if max_leaf >= 0x15 {
@@ -66,16 +71,30 @@ fn tsc_hz() -> u64 {
         }
     }
 
-    if hz != 0 {
-        TSC_HZ_CACHE.store(hz, Ordering::Relaxed);
+    if hz == 0 && max_hypervisor_leaf >= KVM_CPUID_TSC_FREQUENCY {
+        if let Some(leaf) = cpuid(KVM_CPUID_TSC_FREQUENCY) {
+            let khz = leaf.eax as u64;
+            if khz != 0 {
+                hz = khz.saturating_mul(1_000);
+            }
+        }
     }
+
+    TSC_HZ_CACHE.store(hz, Ordering::Relaxed);
+    TSC_HZ_PROBED.store(true, Ordering::Release);
 
     hz
 }
 
-fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
+fn maybe_log_vmexit(vm_id: TdpVmId, _reason: &VmExitReason) {
+    let count = VMEXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
     let hz = tsc_hz();
     if hz == 0 {
+        if count <= 8 || count.is_power_of_two() {
+            maybe_resolve_linux_banner(vm_id);
+            tcp_log::maybe_log_tcp_connections(vm_id);
+        }
         return;
     }
 
@@ -83,7 +102,7 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
     let now = rdtsc();
     let last = VMEXIT_LAST_LOG_TSC.load(Ordering::Relaxed);
 
-    if now.wrapping_sub(last) < interval {
+    if last != 0 && now.wrapping_sub(last) < interval {
         return;
     }
 
@@ -93,19 +112,6 @@ fn maybe_log_vmexit(vm_id: TdpVmId, reason: &VmExitReason) {
     {
         maybe_resolve_linux_banner(vm_id);
         tcp_log::maybe_log_tcp_connections(vm_id);
-        let snapshot = banner_snapshot();
-
-        // log::info!(
-        //     "vmexit periodic log: vm_id={:?} reason={:?} tsc={:#x} linux_banner_gva={:#x} linux_banner_gpa={:#x} tcp_hashinfo_gva={:#x} tcp_hashinfo_gpa={:#x} linux_banner=\"{}\"",
-        //     vm_id,
-        //     reason,
-        //     now,
-        //     snapshot.banner_gva,
-        //     snapshot.banner_gpa,
-        //     snapshot.tcp_hashinfo_gva,
-        //     snapshot.tcp_hashinfo_gpa,
-        //     snapshot.banner_str()
-        // );
     }
 }
 

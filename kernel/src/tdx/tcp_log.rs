@@ -2,21 +2,13 @@
 //
 // Copyright (c) 2024 Intel Corporation.
 
-extern crate alloc;
-
 use super::gctx::GuestCpuContext;
-use super::gmem::{accept_guest_mem, gva2gpa, GuestMemAccessCode};
-use super::guest_symbols::tcp_hashinfo_gva;
+use super::guest_symbols::{read_guest_virt_slice, tcp_hashinfo_gva};
 use super::percpu::this_vcpu;
 use super::utils::TdpVmId;
-use crate::address::{Address, GuestVirtAddr};
+use crate::address::GuestVirtAddr;
 use crate::locking::SpinLock;
-use crate::mm::guestmem::GuestMemMap;
-use crate::types::PAGE_SIZE;
-use alloc::format;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cmp::min;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // Offsets derived from memo/pahole.log (Linux 6.12.0-233.el10.x86_64)
 const INET_HASHINFO_EHASH_OFFSET: usize = 0;
@@ -41,36 +33,42 @@ const HLIST_NULLS_MARKER_BIT: u64 = 0x1;
 const MAX_BUCKET_NODES: usize = 64;
 const MAX_LOGGED_SOCKS: usize = 1024;
 
+static TCP_HASHINFO_LOGGED: AtomicBool = AtomicBool::new(false);
 static LOGGED_SOCKS: SpinLock<LoggedSockCache> = SpinLock::new(LoggedSockCache::new());
 
 struct LoggedSockCache {
-    entries: Vec<u64>,
+    entries: [u64; MAX_LOGGED_SOCKS],
+    len: usize,
     next: usize,
 }
 
 impl LoggedSockCache {
     const fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: [0; MAX_LOGGED_SOCKS],
+            len: 0,
             next: 0,
         }
     }
 
     fn contains(&self, sock_ptr: u64) -> bool {
-        self.entries.iter().any(|entry| *entry == sock_ptr)
+        self.entries[..self.len].contains(&sock_ptr)
     }
 
-    fn insert(&mut self, sock_ptr: u64) {
-        if self.entries.len() < MAX_LOGGED_SOCKS {
-            self.entries.push(sock_ptr);
-            return;
+    fn insert_if_new(&mut self, sock_ptr: u64) -> bool {
+        if self.contains(sock_ptr) {
+            return false;
         }
 
-        if self.next >= self.entries.len() {
-            self.next = 0;
+        if self.len < MAX_LOGGED_SOCKS {
+            self.entries[self.len] = sock_ptr;
+            self.len += 1;
+            return true;
         }
+
         self.entries[self.next] = sock_ptr;
         self.next = (self.next + 1) % MAX_LOGGED_SOCKS;
+        true
     }
 }
 
@@ -87,19 +85,26 @@ pub fn maybe_log_tcp_connections(vm_id: TdpVmId) {
     let ctx = vcpu.get_ctx();
 
     let ehash_ptr = match read_guest_u64(ctx, tcp_hashinfo + INET_HASHINFO_EHASH_OFFSET) {
-        Some(ptr) => ptr,
-        None => return,
+        Some(ptr) if ptr != 0 => ptr,
+        _ => return,
     };
-    if ehash_ptr == 0 {
-        return;
-    }
     let ehash_mask = match read_guest_u32(ctx, tcp_hashinfo + INET_HASHINFO_EHASH_MASK_OFFSET) {
         Some(mask) => mask,
         None => return,
     };
-    let ehash_size = ehash_mask.wrapping_add(1);
-    if ehash_size == 0 {
-        return;
+    let ehash_size = match ehash_mask.checked_add(1) {
+        Some(size) if size != 0 => size,
+        _ => return,
+    };
+
+    if !TCP_HASHINFO_LOGGED.swap(true, Ordering::AcqRel) {
+        // log::info!(
+        //     "guest tcp hashinfo: tcp_hashinfo_gva={:#x} ehash={:#x} ehash_mask={:#x} ehash_size={}",
+        //     u64::from(tcp_hashinfo),
+        //     ehash_ptr,
+        //     ehash_mask,
+        //     ehash_size
+        // );
     }
 
     for bucket_index in 0..ehash_size {
@@ -108,27 +113,34 @@ pub fn maybe_log_tcp_connections(vm_id: TdpVmId) {
 }
 
 fn scan_bucket(ctx: &GuestCpuContext, ehash_ptr: u64, bucket_index: u32) {
-    let bucket_gva =
-        GuestVirtAddr::from(ehash_ptr + (bucket_index as u64) * INET_EHASH_BUCKET_SIZE as u64);
-    let mut node_ptr = match read_guest_u64(ctx, bucket_gva + INET_EHASH_BUCKET_CHAIN_OFFSET) {
+    let bucket_offset = match (bucket_index as u64).checked_mul(INET_EHASH_BUCKET_SIZE as u64) {
+        Some(offset) => offset,
+        None => return,
+    };
+    let bucket_gva = match ehash_ptr
+        .checked_add(bucket_offset)
+        .and_then(|addr| addr.checked_add(INET_EHASH_BUCKET_CHAIN_OFFSET as u64))
+    {
+        Some(addr) => GuestVirtAddr::from(addr),
+        None => return,
+    };
+    let mut node_ptr = match read_guest_u64(ctx, bucket_gva) {
         Some(ptr) => ptr,
         None => return,
     };
 
     let mut scanned = 0;
-    while node_ptr != 0
-        && (node_ptr & HLIST_NULLS_MARKER_BIT) == 0
-        && scanned < MAX_BUCKET_NODES
-    {
+    while node_ptr != 0 && (node_ptr & HLIST_NULLS_MARKER_BIT) == 0 && scanned < MAX_BUCKET_NODES {
         let sock_ptr = match node_ptr.checked_sub(SOCK_COMMON_NULLS_NODE_OFFSET as u64) {
             Some(ptr) => ptr,
             None => break,
         };
-        let sock_gva = GuestVirtAddr::from(sock_ptr);
-        try_log_sock(ctx, bucket_index, sock_ptr, sock_gva);
+        try_log_sock(ctx, bucket_index, sock_ptr);
 
-        let node_gva = GuestVirtAddr::from(node_ptr);
-        node_ptr = match read_guest_u64(ctx, node_gva + HLIST_NULLS_NODE_NEXT_OFFSET) {
+        node_ptr = match read_guest_u64(
+            ctx,
+            GuestVirtAddr::from(node_ptr + HLIST_NULLS_NODE_NEXT_OFFSET as u64),
+        ) {
             Some(ptr) => ptr,
             None => break,
         };
@@ -136,10 +148,8 @@ fn scan_bucket(ctx: &GuestCpuContext, ehash_ptr: u64, bucket_index: u32) {
     }
 }
 
-fn try_log_sock(ctx: &GuestCpuContext, bucket_index: u32, sock_ptr: u64, sock_gva: GuestVirtAddr) {
-    if sock_already_logged(sock_ptr) {
-        return;
-    }
+fn try_log_sock(ctx: &GuestCpuContext, _bucket_index: u32, sock_ptr: u64) {
+    let sock_gva = GuestVirtAddr::from(sock_ptr);
 
     let family = match read_guest_u16(ctx, sock_gva + SOCK_COMMON_FAMILY_OFFSET) {
         Some(val) => val,
@@ -165,123 +175,76 @@ fn try_log_sock(ctx: &GuestCpuContext, bucket_index: u32, sock_ptr: u64, sock_gv
         Some(val) => val,
         None => return,
     };
-    let dport = match read_guest_be16(ctx, sock_gva + SOCK_COMMON_DPORT_OFFSET) {
+    let _dport = match read_guest_be16(ctx, sock_gva + SOCK_COMMON_DPORT_OFFSET) {
         Some(val) => val,
         None => return,
     };
-    let sport = match read_guest_u16(ctx, sock_gva + SOCK_COMMON_NUM_OFFSET) {
+    let _sport = match read_guest_u16(ctx, sock_gva + SOCK_COMMON_NUM_OFFSET) {
         Some(val) => val,
         None => return,
     };
 
-    log_sock_tuple(bucket_index, sock_ptr, state, saddr, sport, daddr, dport);
-    mark_sock_logged(sock_ptr);
-}
-
-fn log_sock_tuple(
-    bucket_index: u32,
-    sock_ptr: u64,
-    state: u8,
-    saddr: u32,
-    sport: u16,
-    daddr: u32,
-    dport: u16,
-) {
-    let src_ip = ipv4_to_string(saddr);
-    let dst_ip = ipv4_to_string(daddr);
-    // log::info!(
-    //     "L2VM TCP: bucket={} sock=0x{:x} state={} {}:{} -> {}:{}",
-    //     bucket_index,
-    //     sock_ptr,
-    //     state,
-    //     src_ip,
-    //     sport,
-    //     dst_ip,
-    //     dport
-    // );
-}
-
-fn ipv4_to_string(addr_be: u32) -> String {
-    let bytes = addr_be.to_be_bytes();
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-fn sock_already_logged(sock_ptr: u64) -> bool {
-    let cache = LOGGED_SOCKS.lock();
-    cache.contains(sock_ptr)
-}
-
-fn mark_sock_logged(sock_ptr: u64) {
-    let mut cache = LOGGED_SOCKS.lock();
-    if cache.contains(sock_ptr) {
+    if !remember_sock(sock_ptr) {
         return;
     }
-    cache.insert(sock_ptr);
+
+    let _src = saddr.to_be_bytes();
+    let _dst = daddr.to_be_bytes();
+    log::info!(
+        "guest tcp: bucket={} sock={:#x} state={} {}.{}.{}.{}:{} -> {}.{}.{}.{}:{}",
+        _bucket_index,
+        sock_ptr,
+        state,
+        _src[0],
+        _src[1],
+        _src[2],
+        _src[3],
+        _sport,
+        _dst[0],
+        _dst[1],
+        _dst[2],
+        _dst[3],
+        _dport
+    );
+}
+
+fn remember_sock(sock_ptr: u64) -> bool {
+    let mut cache = LOGGED_SOCKS.lock();
+    cache.insert_if_new(sock_ptr)
 }
 
 fn read_guest_u64(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u64> {
     let mut buf = [0u8; 8];
-    read_guest_slice(ctx, gva, &mut buf)?;
+    read_guest_virt_slice(ctx, gva, &mut buf)?;
     Some(u64::from_le_bytes(buf))
 }
 
 fn read_guest_u32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
     let mut buf = [0u8; 4];
-    read_guest_slice(ctx, gva, &mut buf)?;
+    read_guest_virt_slice(ctx, gva, &mut buf)?;
     Some(u32::from_le_bytes(buf))
 }
 
 fn read_guest_u16(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u16> {
     let mut buf = [0u8; 2];
-    read_guest_slice(ctx, gva, &mut buf)?;
+    read_guest_virt_slice(ctx, gva, &mut buf)?;
     Some(u16::from_le_bytes(buf))
 }
 
 fn read_guest_u8(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u8> {
     let mut buf = [0u8; 1];
-    read_guest_slice(ctx, gva, &mut buf)?;
+    read_guest_virt_slice(ctx, gva, &mut buf)?;
     Some(buf[0])
 }
 
 fn read_guest_be16(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u16> {
     let mut buf = [0u8; 2];
-    read_guest_slice(ctx, gva, &mut buf)?;
+    read_guest_virt_slice(ctx, gva, &mut buf)?;
     Some(u16::from_be_bytes(buf))
 }
 
 fn read_guest_be32(ctx: &GuestCpuContext, gva: GuestVirtAddr) -> Option<u32> {
     let mut buf = [0u8; 4];
-    read_guest_slice(ctx, gva, &mut buf)?;
+    read_guest_virt_slice(ctx, gva, &mut buf)?;
     Some(u32::from_be_bytes(buf))
-}
-
-fn read_guest_slice(ctx: &GuestCpuContext, gva: GuestVirtAddr, buf: &mut [u8]) -> Option<()> {
-    let mut remaining = buf.len();
-    let mut current_gva = gva;
-    let mut offset = 0;
-
-    while remaining > 0 {
-        let gpa = match gva2gpa(ctx, current_gva, GuestMemAccessCode::empty()) {
-            Ok(Some(gpa)) => gpa,
-            _ => return None,
-        };
-
-        let chunk = min(remaining, PAGE_SIZE - current_gva.page_offset());
-        let aligned_start = gpa.page_align();
-        let aligned_end = (gpa + chunk).page_align_up();
-        if accept_guest_mem(aligned_start, aligned_end).is_err() {
-            return None;
-        }
-
-        let map = GuestMemMap::<u8>::new(gpa, chunk).ok()?;
-        let ptr = map.virt_addr().as_ptr::<u8>();
-        let slice = unsafe { core::slice::from_raw_parts(ptr, chunk) };
-        buf[offset..offset + chunk].copy_from_slice(slice);
-
-        remaining -= chunk;
-        offset += chunk;
-        current_gva = current_gva + chunk;
-    }
-
-    Some(())
 }

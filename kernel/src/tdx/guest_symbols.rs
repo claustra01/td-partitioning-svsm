@@ -2,11 +2,15 @@
 //
 // Copyright (c) 2024 Intel Corporation.
 
-use super::gmem::{copy_from_gpa, gva2gpa, GuestMemAccessCode};
+use super::gctx::GuestCpuContext;
+use super::gmem::{accept_guest_mem, gva2gpa, GuestMemAccessCode};
 use super::percpu::this_vcpu;
 use super::utils::TdpVmId;
-use crate::address::GuestVirtAddr;
+use crate::address::{Address, GuestVirtAddr};
 use crate::locking::SpinLock;
+use crate::mm::guestmem::GuestMemMap;
+use crate::types::PAGE_SIZE;
+use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const LINUX_BANNER_PREFIX: &[u8] = b"Linux version";
@@ -38,7 +42,7 @@ impl BannerCache {
     }
 
     fn set(&mut self, src: &[u8]) {
-        let len = core::cmp::min(src.len(), LINUX_BANNER_MAX_LEN);
+        let len = min(src.len(), LINUX_BANNER_MAX_LEN);
         self.bytes[..len].copy_from_slice(&src[..len]);
         self.len = len;
     }
@@ -93,6 +97,41 @@ fn linux_banner_len(buf: &[u8]) -> Option<usize> {
     }
 }
 
+pub fn read_guest_virt_slice(
+    ctx: &GuestCpuContext,
+    gva: GuestVirtAddr,
+    buf: &mut [u8],
+) -> Option<()> {
+    let mut remaining = buf.len();
+    let mut current_gva = gva;
+    let mut offset = 0;
+
+    while remaining > 0 {
+        let gpa = match gva2gpa(ctx, current_gva, GuestMemAccessCode::empty()) {
+            Ok(Some(gpa)) => gpa,
+            _ => return None,
+        };
+
+        let chunk = min(remaining, PAGE_SIZE - current_gva.page_offset());
+        let aligned_start = gpa.page_align();
+        let aligned_end = (gpa + chunk).page_align_up();
+        if accept_guest_mem(aligned_start, aligned_end).is_err() {
+            return None;
+        }
+
+        let map = GuestMemMap::<u8>::new(gpa, chunk).ok()?;
+        let ptr = map.virt_addr().as_ptr::<u8>();
+        let slice = unsafe { core::slice::from_raw_parts(ptr, chunk) };
+        buf[offset..offset + chunk].copy_from_slice(slice);
+
+        remaining -= chunk;
+        offset += chunk;
+        current_gva = current_gva + chunk;
+    }
+
+    Some(())
+}
+
 pub fn maybe_resolve_linux_banner(vm_id: TdpVmId) {
     if LINUX_BANNER_GVA.load(Ordering::Acquire) != 0 {
         return;
@@ -102,7 +141,6 @@ pub fn maybe_resolve_linux_banner(vm_id: TdpVmId) {
         return;
     }
 
-    let mut found = false;
     let vcpu = this_vcpu(vm_id);
     if vcpu.get_ctx().get_cr3() != 0 {
         let ctx = vcpu.get_ctx();
@@ -114,38 +152,47 @@ pub fn maybe_resolve_linux_banner(vm_id: TdpVmId) {
                 _ => continue,
             };
 
-            let buf = match copy_from_gpa::<[u8; LINUX_BANNER_MAX_LEN]>(gpa) {
-                Ok(buf) => buf,
-                Err(_) => continue,
-            };
+            let mut buf = [0u8; LINUX_BANNER_MAX_LEN];
+            if read_guest_virt_slice(ctx, gva, &mut buf).is_none() {
+                continue;
+            }
 
             if let Some(len) = linux_banner_len(&buf) {
-                LINUX_BANNER_GVA.store(gva_val, Ordering::Relaxed);
-                LINUX_BANNER_GPA.store(u64::from(gpa), Ordering::Relaxed);
-
-                let mut cache = LINUX_BANNER_CACHE.lock();
-                cache.set(&buf[..len]);
-
+                let mut tcp_hashinfo_gva = 0;
+                let mut tcp_hashinfo_gpa = 0;
                 if let Some(tcp_gva_val) = gva_val.checked_add(TCP_HASHINFO_OFFSET) {
-                    TCP_HASHINFO_GVA.store(tcp_gva_val, Ordering::Relaxed);
-                    if let Ok(Some(tcp_gpa)) =
-                        gva2gpa(ctx, GuestVirtAddr::from(tcp_gva_val), GuestMemAccessCode::empty())
-                    {
-                        TCP_HASHINFO_GPA.store(u64::from(tcp_gpa), Ordering::Relaxed);
+                    tcp_hashinfo_gva = tcp_gva_val;
+                    if let Ok(Some(tcp_gpa)) = gva2gpa(
+                        ctx,
+                        GuestVirtAddr::from(tcp_gva_val),
+                        GuestMemAccessCode::empty(),
+                    ) {
+                        tcp_hashinfo_gpa = u64::from(tcp_gpa);
                     }
                 }
 
-                found = true;
+                {
+                    let mut cache = LINUX_BANNER_CACHE.lock();
+                    cache.set(&buf[..len]);
+                }
+
+                TCP_HASHINFO_GVA.store(tcp_hashinfo_gva, Ordering::Relaxed);
+                TCP_HASHINFO_GPA.store(tcp_hashinfo_gpa, Ordering::Relaxed);
+                LINUX_BANNER_GPA.store(u64::from(gpa), Ordering::Relaxed);
+                LINUX_BANNER_GVA.store(gva_val, Ordering::Release);
+
+                let snapshot = banner_snapshot();
+                log::info!(
+                    "guest symbols: linux_banner_gva={:#x} linux_banner_gpa={:#x} tcp_hashinfo_gva={:#x} tcp_hashinfo_gpa={:#x} linux_banner=\"{}\"",
+                    snapshot.banner_gva,
+                    snapshot.banner_gpa,
+                    snapshot.tcp_hashinfo_gva,
+                    snapshot.tcp_hashinfo_gpa,
+                    snapshot.banner_str()
+                );
                 break;
             }
         }
-    }
-
-    if !found {
-        LINUX_BANNER_GVA.store(0, Ordering::Relaxed);
-        LINUX_BANNER_GPA.store(0, Ordering::Relaxed);
-        TCP_HASHINFO_GVA.store(0, Ordering::Relaxed);
-        TCP_HASHINFO_GPA.store(0, Ordering::Relaxed);
     }
 
     LINUX_BANNER_SCAN_IN_PROGRESS.store(false, Ordering::Release);
