@@ -116,7 +116,7 @@ fn maybe_log_vmexit(vm_id: TdpVmId, _reason: &VmExitReason) {
         .is_ok()
     {
         maybe_resolve_linux_banner(vm_id);
-        tcp_log::maybe_log_tcp_connections(vm_id);
+        // tcp_log::maybe_log_tcp_connections(vm_id);
     }
 }
 
