@@ -37,6 +37,7 @@ const VMEXIT_LOG_INTERVAL_SECS: u64 = 30;
 const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
 const KVM_CPUID_TSC_FREQUENCY: u32 = KVM_CPUID_SIGNATURE | 0x10;
 
+static VMEXIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static VMEXIT_LAST_LOG_TSC: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ_PROBED: AtomicBool = AtomicBool::new(false);
 static TSC_HZ_CACHE: AtomicU64 = AtomicU64::new(0);
@@ -86,8 +87,14 @@ fn tsc_hz() -> u64 {
 }
 
 fn maybe_log_vmexit(vm_id: TdpVmId, _reason: &VmExitReason) {
+    let count = VMEXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
     let hz = tsc_hz();
     if hz == 0 {
+        if count <= 8 || count.is_power_of_two() {
+            maybe_resolve_linux_banner(vm_id);
+            tcp_log::maybe_log_tcp_connections(vm_id);
+        }
         return;
     }
 
@@ -95,7 +102,12 @@ fn maybe_log_vmexit(vm_id: TdpVmId, _reason: &VmExitReason) {
     let now = rdtsc();
     let last = VMEXIT_LAST_LOG_TSC.load(Ordering::Relaxed);
 
-    if last != 0 && now.wrapping_sub(last) < interval {
+    if last == 0 {
+        let _ = VMEXIT_LAST_LOG_TSC.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+        return;
+    }
+
+    if now.wrapping_sub(last) < interval {
         return;
     }
 
