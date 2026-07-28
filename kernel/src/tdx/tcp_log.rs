@@ -190,22 +190,22 @@ fn try_log_sock(ctx: &GuestCpuContext, _bucket_index: u32, sock_ptr: u64) {
 
     let _src = saddr.to_be_bytes();
     let _dst = daddr.to_be_bytes();
-    log::info!(
-        "guest tcp: bucket={} sock={:#x} state={} {}.{}.{}.{}:{} -> {}.{}.{}.{}:{}",
-        _bucket_index,
-        sock_ptr,
-        state,
-        _src[0],
-        _src[1],
-        _src[2],
-        _src[3],
-        _sport,
-        _dst[0],
-        _dst[1],
-        _dst[2],
-        _dst[3],
-        _dport
-    );
+    // log::info!(
+    //     "guest tcp: bucket={} sock={:#x} state={} {}.{}.{}.{}:{} -> {}.{}.{}.{}:{}",
+    //     _bucket_index,
+    //     sock_ptr,
+    //     state,
+    //     _src[0],
+    //     _src[1],
+    //     _src[2],
+    //     _src[3],
+    //     _sport,
+    //     _dst[0],
+    //     _dst[1],
+    //     _dst[2],
+    //     _dst[3],
+    //     _dport
+    // );
 }
 
 fn remember_sock(sock_ptr: u64) -> bool {
