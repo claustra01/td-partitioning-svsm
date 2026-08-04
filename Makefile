@@ -1,5 +1,29 @@
 FEATURES ?= "default"
-SVSM_ARGS = --features ${FEATURES}
+TCP_LOG_MODE ?= enabled
+
+# disabled: keep the current no-log path.
+# logging-disabled: enable TSC/heartbeat logging, but not TCP log output.
+# enabled: enable the configurable logging (the default).
+ifeq ($(TCP_LOG_MODE),disabled)
+TCP_LOG_FEATURES =
+else ifeq ($(TCP_LOG_MODE),logging-disabled)
+TCP_LOG_FEATURES = tcp-log
+else ifeq ($(TCP_LOG_MODE),enabled)
+TCP_LOG_FEATURES = tcp-log-output
+else
+$(error TCP_LOG_MODE must be one of: disabled, logging-disabled, enabled)
+endif
+
+BUILD_FEATURES := $(FEATURES)
+ifneq ($(TCP_LOG_FEATURES),)
+ifneq ($(BUILD_FEATURES),)
+BUILD_FEATURES := $(BUILD_FEATURES),$(TCP_LOG_FEATURES)
+else
+BUILD_FEATURES := $(TCP_LOG_FEATURES)
+endif
+endif
+
+SVSM_ARGS = --features ${BUILD_FEATURES}
 
 ifdef RELEASE
 TARGET_PATH=release
@@ -39,6 +63,12 @@ IGVMBUILDER = "target/x86_64-unknown-linux-gnu/${TARGET_PATH}/igvmbuilder"
 IGVMBIN = bin/igvmbld
 
 all: svsm.bin igvm
+
+tsc-only:
+	$(MAKE) TCP_LOG_MODE=logging-disabled all
+
+no-log:
+	$(MAKE) TCP_LOG_MODE=disabled all
 
 igvm: $(IGVM_FILES) $(IGVMBIN)
 
@@ -129,5 +159,4 @@ clean:
 	rm -f stage1/stage2.bin svsm.bin stage1/meta.bin stage1/kernel.elf stage1/stage1 stage1/svsm-fs.bin ${STAGE1_OBJS} utils/gen_meta utils/print-meta
 	rm -rf bin
 
-.PHONY: test clean clippy stage1/stage2.bin stage1/svsm-kernel.elf stage1/test-kernel.elf
-
+.PHONY: test clean clippy tsc-only no-log stage1/stage2.bin stage1/svsm-kernel.elf stage1/test-kernel.elf

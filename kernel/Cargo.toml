@@ -39,6 +39,8 @@ test.workspace = true
 [features]
 default = []
 enable-gdb = ["dep:gdbstub", "dep:gdbstub_arch"]
+tcp-log = []
+tcp-log-output = ["tcp-log"]
 fuzzing-hooks = []
 
 [dev-dependencies]
