@@ -33,7 +33,7 @@ use crate::mm::memory::is_guest_phys_addr_valid;
 use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const VMEXIT_LOG_INTERVAL_SECS: u64 = 30;
+const VMEXIT_LOG_INTERVAL_SECS: u64 = 60;
 const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
 const KVM_CPUID_TSC_FREQUENCY: u32 = KVM_CPUID_SIGNATURE | 0x10;
 
